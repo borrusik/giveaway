@@ -1,23 +1,29 @@
 import asyncio
 import logging
+import signal
 from aiogram import Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from datetime import datetime
 
-from config import BOT_TOKEN
-from db.database import init_db
+from config import BOT_TOKEN, LOG_LEVEL
+from db.database import init_db, close_db
 from instance import bot
 from middlewares.channel_join import ChannelJoinMiddleware
+from middlewares.error_handler import ErrorHandlerMiddleware
 from services.draw_manager import check_scheduled_draws
+from utils.logger import setup_logger
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = setup_logger("bot", LOG_LEVEL)
+
+# Global shutdown flag
+shutdown_event = asyncio.Event()
 
 # Scheduler task
-# Scheduler task
 async def scheduled_tasks():
-    while True:
+    check_interval = 3600  # Default: check every hour
+    
+    while not shutdown_event.is_set():
         try:
             # Check for draws that need to be ended
             results = await check_scheduled_draws()
@@ -59,14 +65,33 @@ async def scheduled_tasks():
                     try:
                         from config import CHANNEL_ID
                         await bot.send_message(CHANNEL_ID, winner_text)
+                        logger.info(f"Winner announcement sent to channel for draw #{result['draw_id']}")
                     except Exception as e:
-                        logger.error(f"Error sending winner announcement: {e}")
+                        logger.error(f"Error sending winner announcement: {e}", exc_info=True)
             
         except Exception as e:
-            logger.error(f"Error in scheduler: {e}")
+            logger.error(f"Error in scheduler: {e}", exc_info=True)
         
-        # Check every hour
-        await asyncio.sleep(3600)
+        # Wait for next check interval or until shutdown is requested
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=check_interval)
+        except asyncio.TimeoutError:
+            pass  # Normal timeout, continue with the next iteration
+
+async def shutdown(dispatcher: Dispatcher):
+    """Graceful shutdown function"""
+    logger.info("Shutting down...")
+    
+    # Signal scheduler task to stop
+    shutdown_event.set()
+    
+    # Close bot session
+    await bot.session.close()
+    
+    # Close DB connections
+    close_db()
+    
+    logger.info("Shutdown complete")
 
 async def main():
     # Initialize dispatcher with storage
@@ -74,6 +99,8 @@ async def main():
     
     # Register middlewares
     dp.message.middleware(ChannelJoinMiddleware())
+    dp.message.middleware(ErrorHandlerMiddleware())
+    dp.callback_query.middleware(ErrorHandlerMiddleware())
     
     # Import routers here to avoid circular imports
     from handlers import admin, common, stats
@@ -89,11 +116,22 @@ async def main():
     # Set bot commands
     await set_commands()
     
-    # Start the scheduler task
-    asyncio.create_task(scheduled_tasks())
+    # Setup signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(dp)))
     
-    # Start polling
-    await dp.start_polling(bot, skip_updates=True)
+    # Start the scheduler task
+    scheduler_task = asyncio.create_task(scheduled_tasks())
+    
+    try:
+        # Start polling
+        logger.info("Starting bot")
+        await dp.start_polling(bot, skip_updates=True)
+    finally:
+        # Ensure the scheduler task is cancelled if polling stops
+        scheduler_task.cancel()
+        await shutdown(dp)
     
 async def set_commands():
     from aiogram.types import BotCommand
@@ -101,12 +139,12 @@ async def set_commands():
         BotCommand(command="start", description="Почати участь у розіграші"),
         BotCommand(command="me", description="Переглянути свою статистику"),
         BotCommand(command="top", description="Переглянути лідерів запрошень"),
+        BotCommand(command="draws", description="Переглянути активні розіграші"),
         BotCommand(command="help", description="Показати довідку")
     ]
     await bot.set_my_commands(commands)
 
 if __name__ == "__main__":
-    logger.info("Starting bot")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
